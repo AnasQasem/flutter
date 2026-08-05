@@ -59,6 +59,17 @@ class PathSource {
   virtual Rect GetBounds() const = 0;
   virtual bool IsConvex() const = 0;
   virtual void Dispatch(PathReceiver& receiver) const = 0;
+
+  //----------------------------------------------------------------------------
+  /// @brief      A stable identifier for the geometry this source dispatches,
+  /// or
+  ///             0 when the source cannot provide one.
+  ///
+  ///             Used to reuse tessellation results across frames. Two sources
+  ///             reporting the same non-zero id MUST dispatch identical
+  ///             geometry, and any mutation MUST change the id. The fill type
+  ///             need not be reflected — it does not affect tessellation.
+  virtual uint32_t GetGeometryID() const { return 0; }
 };
 
 /// @brief A PathSource object that provides path iteration for any TRect.

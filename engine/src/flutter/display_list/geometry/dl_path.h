@@ -69,6 +69,15 @@ class DlPath : public impeller::PathSource {
 
   void Dispatch(DlPathReceiver& receiver) const override;
 
+  // |impeller::PathSource|
+  /// Skia derives this from the verbs and points (not the fill type, which does
+  /// not affect tessellation) and it survives the copy-on-write copies made
+  /// when wrapping a shared SkPath, so the same geometry keeps one id across
+  /// frames.
+  uint32_t GetGeometryID() const override {
+    return GetSkPath().getGenerationID();
+  }
+
   /// Intent to render an SkPath multiple times will make the path
   /// non-volatile to enable caching in Skia. Calling this method
   /// before every rendering call that uses the SkPath will count

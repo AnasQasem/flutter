@@ -2,12 +2,16 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <chrono>
+#include <fstream>
+
 #include "flutter/display_list/testing/dl_test_snippets.h"
 #include "flutter/testing/testing.h"
 #include "gtest/gtest.h"
 #include "impeller/core/host_buffer.h"
 #include "impeller/playground/playground.h"
 #include "impeller/playground/playground_test.h"
+#include "impeller/tessellator/tessellator.h"
 #include "impeller/typographer/backends/skia/text_frame_skia.h"
 #include "impeller/typographer/backends/skia/typographer_context_skia.h"
 #include "impeller/typographer/font_glyph_pair.h"
@@ -76,6 +80,241 @@ TEST_P(TypographerTest, CanConvertTextBlob) {
     ASSERT_TRUE(run.IsValid());
     ASSERT_EQ(run.GetGlyphCount(), 45u);
   }
+}
+
+TEST_P(TypographerTest, TextFrameReturnsColorPathsFromCreator) {
+  std::vector<TextRun> runs;
+  TextFrame frame(runs, Rect::MakeLTRB(0, 0, 10, 10), /*has_color=*/true,
+                  /*path_creator=*/{},
+                  /*color_path_creator=*/[]() {
+                    std::vector<ColorGlyphLayer> layers(2);
+                    layers[0].use_foreground_color = true;
+                    layers[1].color = Color::Red();
+                    return layers;
+                  });
+  std::vector<ColorGlyphLayer> layers = frame.GetColorPaths();
+  ASSERT_EQ(layers.size(), 2u);
+  EXPECT_TRUE(layers[0].use_foreground_color);
+  EXPECT_FALSE(layers[1].use_foreground_color);
+  EXPECT_EQ(layers[1].color, Color::Red());
+}
+
+TEST_P(TypographerTest, TextFrameWithoutColorPathCreatorHasNoColorPaths) {
+  TextFrame frame;
+  EXPECT_TRUE(frame.GetColorPaths().empty());
+}
+
+// Impeller's tessellation cache is keyed by SkPath::getGenerationID(), which is
+// per-instance. Every rebuild of a widget subtree makes a NEW blob for the same
+// text, so unless equal geometry yields one shared path, a page re-tessellates
+// from scratch on every visit and pre-painting it can never warm anything.
+TEST_P(TypographerTest, EqualBlobGeometrySharesOnePathIdentity) {
+  SkFont font = flutter::testing::CreateTestFontOfSize(12);
+  auto make = [&font](const char* text) {
+    auto blob = SkTextBlob::MakeFromString(text, font);
+    EXPECT_TRUE(blob);
+    return MakeTextFrameFromTextBlobSkia(blob)->GetPath();
+  };
+
+  fml::StatusOr<flutter::DlPath> a = make("the quick brown fox");
+  fml::StatusOr<flutter::DlPath> b = make("the quick brown fox");
+  fml::StatusOr<flutter::DlPath> other = make("jumped over the lazy dog");
+  ASSERT_TRUE(a.ok());
+  ASSERT_TRUE(b.ok());
+  ASSERT_TRUE(other.ok());
+
+  // Independently built blobs, identical geometry => one cache entry.
+  EXPECT_EQ(a.value().GetGeometryID(), b.value().GetGeometryID());
+  EXPECT_NE(a.value().GetGeometryID(), other.value().GetGeometryID());
+
+  // Same text at a different size is different geometry and must not collide.
+  SkFont bigger = flutter::testing::CreateTestFontOfSize(24);
+  auto big_blob = SkTextBlob::MakeFromString("the quick brown fox", bigger);
+  ASSERT_TRUE(big_blob);
+  fml::StatusOr<flutter::DlPath> big =
+      MakeTextFrameFromTextBlobSkia(big_blob)->GetPath();
+  ASSERT_TRUE(big.ok());
+  EXPECT_NE(a.value().GetGeometryID(), big.value().GetGeometryID());
+}
+
+// The rasterizer asks for these on every frame that repaints the text, and
+// extraction walks the COLR table plus every glyph outline. Recomputing it per
+// frame dominated the cost of scrolling color text, so the result is cached.
+TEST_P(TypographerTest, ColorPathsAreExtractedOnlyOnce) {
+  std::vector<TextRun> runs;
+  int extractions = 0;
+  TextFrame frame(runs, Rect::MakeLTRB(0, 0, 10, 10), /*has_color=*/true,
+                  /*path_creator=*/{},
+                  /*color_path_creator=*/[&extractions]() {
+                    extractions++;
+                    std::vector<ColorGlyphLayer> layers(1);
+                    layers[0].color = Color::Red();
+                    return layers;
+                  });
+
+  ASSERT_EQ(frame.GetColorPaths().size(), 1u);
+  ASSERT_EQ(frame.GetColorPaths().size(), 1u);
+  frame.GetColorPaths();
+  EXPECT_EQ(extractions, 1);
+}
+
+TEST_P(TypographerTest, NonColrColorFontHasNoColorPaths) {
+#if FML_OS_MACOSX
+  auto mapping = flutter::testing::OpenFixtureAsSkData("Apple Color Emoji.ttc");
+#else
+  auto mapping = flutter::testing::OpenFixtureAsSkData("NotoColorEmoji.ttf");
+#endif
+  ASSERT_TRUE(mapping);
+  sk_sp<SkFontMgr> font_mgr = txt::GetDefaultFontManager();
+  SkFont emoji_font(font_mgr->makeFromData(mapping), 50.0);
+  auto frame = MakeTextFrameFromTextBlobSkia(
+      SkTextBlob::MakeFromString("😀 ", emoji_font));
+  ASSERT_TRUE(frame->HasColor());
+  // Bitmap emoji formats (CBDT/sbix) carry no COLRv0 layer list, so color
+  // path extraction must come back empty and rendering falls back to the
+  // color glyph atlas.
+  EXPECT_TRUE(frame->GetColorPaths().empty());
+}
+
+// MEASUREMENT (not a correctness test): where does the cost of drawing a page
+// of COLR text actually go? Splits outline decode from layer extraction from
+// tessellation, using a real 2500-upem COLR Quran font. Needs /tmp/hafs_1.ttf
+// and /tmp/hafs_glyphs.txt; skips silently otherwise.
+TEST_P(TypographerTest, MeasureColorTextCost) {
+  sk_sp<SkData> font_data = SkData::MakeFromFileName("/tmp/hafs_1.ttf");
+  if (!font_data) {
+    GTEST_SKIP() << "no /tmp/hafs_1.ttf";
+  }
+  std::ifstream gid_file("/tmp/hafs_glyphs.txt");
+  if (!gid_file) {
+    GTEST_SKIP() << "no /tmp/hafs_glyphs.txt";
+  }
+  std::vector<SkGlyphID> gids;
+  for (int gid = 0; gid_file >> gid;) {
+    gids.push_back(static_cast<SkGlyphID>(gid));
+  }
+  ASSERT_FALSE(gids.empty());
+
+  sk_sp<SkFontMgr> font_mgr = txt::GetDefaultFontManager();
+  sk_sp<SkTypeface> typeface = font_mgr->makeFromData(font_data);
+  ASSERT_TRUE(typeface);
+
+  using Clock = std::chrono::steady_clock;
+  auto ms = [](Clock::duration d) {
+    return std::chrono::duration<double, std::milli>(d).count();
+  };
+
+  // One "page": every glyph laid out on a grid, at a typical reading size.
+  auto build_blob = [&](Scalar size) {
+    SkFont font(typeface, size);
+    SkTextBlobBuilder builder;
+    const SkTextBlobBuilder::RunBuffer& run =
+        builder.allocRunPos(font, gids.size());
+    for (size_t i = 0; i < gids.size(); i++) {
+      run.glyphs[i] = gids[i];
+      run.points()[i] =
+          SkPoint::Make((i % 20) * size * 1.2f, (i / 20) * size * 1.6f);
+    }
+    return builder.make();
+  };
+
+  // Cold: a size never extracted before, so Skia must decode every outline.
+  sk_sp<SkTextBlob> cold_blob = build_blob(25.0f);
+  auto t0 = Clock::now();
+  std::shared_ptr<TextFrame> cold_frame =
+      MakeTextFrameFromTextBlobSkia(cold_blob);
+  auto t1 = Clock::now();
+  size_t layer_count = cold_frame->GetColorPaths().size();
+  auto t2 = Clock::now();
+
+  // Warm: same size again in a NEW frame — Skia's strike still holds the
+  // outlines, so this isolates extraction from decode.
+  sk_sp<SkTextBlob> warm_blob = build_blob(25.0f);
+  auto t3 = Clock::now();
+  std::shared_ptr<TextFrame> warm_frame =
+      MakeTextFrameFromTextBlobSkia(warm_blob);
+  size_t warm_layers = warm_frame->GetColorPaths().size();
+  auto t4 = Clock::now();
+
+  // A DIFFERENT size, as the app's per-line FittedBox produces: does Skia
+  // re-decode every outline for each size?
+  sk_sp<SkTextBlob> other_size = build_blob(31.0f);
+  auto t5 = Clock::now();
+  std::shared_ptr<TextFrame> other_frame =
+      MakeTextFrameFromTextBlobSkia(other_size);
+  other_frame->GetColorPaths();
+  auto t6 = Clock::now();
+
+  // Per-frame cost: tessellating every layer path, as the rasterizer does.
+  std::vector<Point> points;
+  std::vector<uint16_t> indices;
+  auto t7 = Clock::now();
+  for (const ColorGlyphLayer& layer : cold_frame->GetColorPaths()) {
+    Tessellator::TessellateConvexInternal(layer.path, points, indices, 3.5f);
+  }
+  auto t8 = Clock::now();
+
+  // The same work through the real entry point, which now caches by path
+  // identity + tolerance. First pass populates, second pass should be a copy.
+  std::shared_ptr<HostBuffer> vtx_buffer = HostBuffer::Create(
+      GetContext()->GetResourceAllocator(), GetContext()->GetIdleWaiter(),
+      GetContext()->GetCapabilities()->GetMinimumUniformAlignment());
+  std::shared_ptr<HostBuffer> idx_buffer = HostBuffer::Create(
+      GetContext()->GetResourceAllocator(), GetContext()->GetIdleWaiter(),
+      GetContext()->GetCapabilities()->GetMinimumUniformAlignment());
+  Tessellator tessellator;
+  auto tessellate_page = [&]() {
+    for (const ColorGlyphLayer& layer : cold_frame->GetColorPaths()) {
+      tessellator.TessellateConvex(layer.path, *vtx_buffer, *idx_buffer, 3.5f,
+                                   /*supports_primitive_restart=*/false,
+                                   /*supports_triangle_fan=*/false);
+    }
+  };
+  auto t11 = Clock::now();
+  tessellate_page();
+  auto t12 = Clock::now();
+  tessellate_page();
+  auto t13 = Clock::now();
+  tessellate_page();
+  auto t14 = Clock::now();
+
+  // Vulkan (i.e. Android) takes the primitive-restart streaming path instead,
+  // which fills caller-sized storage — measure and exercise that variant too.
+  Tessellator restart_tessellator;
+  auto tessellate_page_restart = [&]() {
+    for (const ColorGlyphLayer& layer : cold_frame->GetColorPaths()) {
+      restart_tessellator.TessellateConvex(layer.path, *vtx_buffer, *idx_buffer,
+                                           3.5f,
+                                           /*supports_primitive_restart=*/true,
+                                           /*supports_triangle_fan=*/true);
+    }
+  };
+  auto t15 = Clock::now();
+  tessellate_page_restart();
+  auto t16 = Clock::now();
+  tessellate_page_restart();
+  auto t17 = Clock::now();
+
+  // Second call on the memoized frame: proves GetColorPaths is not re-running.
+  auto t9 = Clock::now();
+  cold_frame->GetColorPaths();
+  auto t10 = Clock::now();
+
+  FML_LOG(ERROR)
+      << "\n=== COLR page cost (" << gids.size() << " glyphs, " << layer_count
+      << " layers) ===\n"
+      << "  MakeTextFrame (has_color scan): " << ms(t1 - t0) << " ms\n"
+      << "  extract COLD (decode+build):    " << ms(t2 - t1) << " ms\n"
+      << "  frame+extract WARM strike:      " << ms(t4 - t3) << " ms\n"
+      << "  frame+extract NEW SIZE:         " << ms(t6 - t5) << " ms\n"
+      << "  tessellate all layers:          " << ms(t8 - t7) << " ms\n"
+      << "  memoized GetColorPaths:         " << ms(t10 - t9) << " ms\n"
+      << "  TessellateConvex pass 1 (cold): " << ms(t12 - t11) << " ms\n"
+      << "  TessellateConvex pass 2 (cache):" << ms(t13 - t12) << " ms\n"
+      << "  TessellateConvex pass 3 (cache):" << ms(t14 - t13) << " ms\n"
+      << "  restart/fan pass 1 (cold):      " << ms(t16 - t15) << " ms\n"
+      << "  restart/fan pass 2 (cache):     " << ms(t17 - t16) << " ms\n";
+  EXPECT_EQ(layer_count, warm_layers);
 }
 
 TEST_P(TypographerTest, CanCreateRenderContext) {

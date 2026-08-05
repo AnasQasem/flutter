@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "flutter/fml/trace_event.h"
 #include "flutter/impeller/core/device_buffer.h"
 #include "flutter/impeller/tessellator/path_tessellator.h"
 
@@ -328,12 +329,158 @@ class ConvexTessellatorImpl : public Tessellator::ConvexTessellator {
     index_buffer_.reserve(2048);
   }
 
+ private:
+  // One path's tessellated vertices, reused for as long as the path keeps being
+  // drawn at this tolerance.
+  struct CacheEntry {
+    std::vector<Point> points;
+    std::vector<IndexT> indices;
+    size_t point_count = 0u;  // Valid prefix of `points`.
+    size_t index_count = 0u;  // Valid prefix of `indices`; also vertex_count.
+    uint64_t last_used = 0u;
+  };
+
+  // Roughly two pages of Quran glyph outlines. Bounded because an app that
+  // draws a fresh path every frame (an animated shape) would otherwise grow
+  // this without limit.
+  static constexpr size_t kMaxCachedBytes = 24u * 1024u * 1024u;
+
+  static uint64_t MakeCacheKey(uint32_t geometry_id,
+                               Scalar tolerance,
+                               bool supports_primitive_restart,
+                               bool supports_triangle_fan) {
+    // Tolerance decides how finely curves are flattened, so it is part of the
+    // identity. Quantized to 1/16 so that imperceptible scale jitter still
+    // hits.
+    Scalar quantized = std::round(std::clamp(tolerance, 0.0f, 4095.0f) * 16.0f);
+    uint64_t writer = (supports_primitive_restart ? 0b10u : 0u) |
+                      (supports_triangle_fan ? 0b01u : 0u);
+    return (static_cast<uint64_t>(geometry_id) << 32) |
+           (static_cast<uint64_t>(quantized) << 2) | writer;
+  }
+
+  size_t EntryBytes(const CacheEntry& entry) const {
+    return entry.points.capacity() * sizeof(Point) +
+           entry.indices.capacity() * sizeof(IndexT);
+  }
+
+  /// Tessellate `path` once and keep the result under `key`.
+  typename std::unordered_map<uint64_t, CacheEntry>::iterator Populate(
+      uint64_t key,
+      const PathSource& path,
+      Scalar tolerance,
+      bool supports_primitive_restart,
+      bool supports_triangle_fan) {
+    // Cache miss only. Whether a cold page paint is tessellation or something
+    // else is not answerable from the stock trace — Encode has no slices — so
+    // count the misses directly. A page's worth of these in one frame means the
+    // cache key is not matching across widget subtrees.
+    TRACE_EVENT0("impeller", "TessellateCacheMiss");
+    CacheEntry entry;
+    if (supports_primitive_restart) {
+      // The streaming writers need storage sized up front, exactly as the
+      // uncached path sizes its host buffer allocation.
+      const auto [point_count, contour_count] =
+          PathTessellator::CountFillStorage(path, tolerance);
+      entry.points.resize(point_count);
+      entry.indices.resize(point_count + contour_count);
+      if (supports_triangle_fan) {
+        FanPathVertexWriter writer(entry.points.data(), entry.indices.data());
+        PathTessellator::PathToFilledVertices(path, writer, tolerance);
+        entry.point_count = writer.GetPointCount();
+        entry.index_count = writer.GetIndexCount();
+      } else {
+        StripPathVertexWriter writer(entry.points.data(), entry.indices.data());
+        PathTessellator::PathToFilledVertices(path, writer, tolerance);
+        entry.point_count = writer.GetPointCount();
+        entry.index_count = writer.GetIndexCount();
+      }
+      FML_DCHECK(entry.point_count <= point_count);
+      FML_DCHECK(entry.index_count <= point_count + contour_count);
+    } else {
+      DoTessellateConvexInternal(path, entry.points, entry.indices, tolerance);
+      entry.point_count = entry.points.size();
+      entry.index_count = entry.indices.size();
+    }
+
+    cached_bytes_ += EntryBytes(entry);
+    auto [it, inserted] = cache_.insert_or_assign(key, std::move(entry));
+    if (cached_bytes_ > kMaxCachedBytes) {
+      EvictLeastRecentlyUsed(key);
+    }
+    return it;
+  }
+
+  /// Drops the older half of the cache by last use, never `keep`.
+  void EvictLeastRecentlyUsed(uint64_t keep) {
+    std::vector<uint64_t> by_age;
+    by_age.reserve(cache_.size());
+    for (const auto& [key, entry] : cache_) {
+      if (key != keep) {
+        by_age.push_back(key);
+      }
+    }
+    std::sort(by_age.begin(), by_age.end(), [&](uint64_t a, uint64_t b) {
+      return cache_.at(a).last_used < cache_.at(b).last_used;
+    });
+    for (uint64_t key : by_age) {
+      if (cached_bytes_ <= kMaxCachedBytes / 2u) {
+        break;
+      }
+      cached_bytes_ -= EntryBytes(cache_.at(key));
+      cache_.erase(key);
+    }
+  }
+
+  std::unordered_map<uint64_t, CacheEntry> cache_;
+  uint64_t tick_ = 0u;
+  size_t cached_bytes_ = 0u;
+
+ public:
   VertexBuffer TessellateConvex(const PathSource& path,
                                 HostBuffer& data_host_buffer,
                                 HostBuffer& indexes_host_buffer,
                                 Scalar tolerance,
                                 bool supports_primitive_restart,
                                 bool supports_triangle_fan) override {
+    // Filling a path walks and flattens it into triangles on the CPU EVERY time
+    // it is drawn — Impeller keeps no geometry cache. For text drawn as paths
+    // that is ruinous: one page of COLR Quran glyphs re-tessellates ~1000
+    // immutable outlines, measured at ~6 ms, and it repeats at 120 Hz. Reuse
+    // the vertices whenever the exact same geometry is filled again at the same
+    // flattening tolerance. Raster-thread only, like the rest of Tessellator.
+    const uint32_t geometry_id = path.GetGeometryID();
+    if (geometry_id != 0) {
+      const uint64_t key =
+          MakeCacheKey(geometry_id, tolerance, supports_primitive_restart,
+                       supports_triangle_fan);
+      auto it = cache_.find(key);
+      if (it == cache_.end()) {
+        it = Populate(key, path, tolerance, supports_primitive_restart,
+                      supports_triangle_fan);
+      }
+      CacheEntry& entry = it->second;
+      entry.last_used = ++tick_;
+      if (entry.index_count == 0) {
+        return VertexBuffer{
+            .vertex_buffer = {},
+            .index_buffer = {},
+            .vertex_count = 0u,
+            .index_type = IndexTypeFor<IndexT>(),
+        };
+      }
+      return VertexBuffer{
+          .vertex_buffer = data_host_buffer.Emplace(
+              entry.points.data(), sizeof(Point) * entry.point_count,
+              alignof(Point)),
+          .index_buffer = indexes_host_buffer.Emplace(
+              entry.indices.data(), sizeof(IndexT) * entry.index_count,
+              alignof(IndexT)),
+          .vertex_count = entry.index_count,
+          .index_type = IndexTypeFor<IndexT>(),
+      };
+    }
+
     if (supports_primitive_restart) {
       // Primitive Restart.
       const auto [point_count, contour_count] =

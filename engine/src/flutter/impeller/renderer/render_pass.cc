@@ -5,6 +5,7 @@
 #include "impeller/renderer/render_pass.h"
 
 #include <utility>
+#include "flutter/fml/trace_event.h"
 #include "fml/status.h"
 #include "impeller/base/validation.h"
 #include "impeller/core/vertex_buffer.h"
@@ -76,6 +77,11 @@ bool RenderPass::AddCommand(Command&& command) {
 }
 
 bool RenderPass::EncodeCommands() const {
+  // SurfaceFrame::Encode has no slices of its own, so a 47 ms raster frame in a
+  // Quran page settle was unattributable. This splits it in two: time inside
+  // here is translating entities into GPU commands, time outside is building
+  // those entities (Canvas / geometry / tessellation).
+  TRACE_EVENT0("impeller", "RenderPass::EncodeCommands");
   return OnEncodeCommands(*context_);
 }
 

@@ -13,6 +13,7 @@
 #include "display_list/dl_sampling_options.h"
 #include "display_list/effects/dl_image_filter.h"
 #include "flutter/fml/logging.h"
+#include "flutter/fml/trace_event.h"
 #include "fml/closure.h"
 #include "impeller/core/formats.h"
 #include "impeller/display_list/aiks_context.h"
@@ -1312,8 +1313,19 @@ bool RenderToTarget(ContentContext& context,
                     Rect cull_rect,
                     bool reset_host_buffer,
                     bool is_onscreen) {
+  // SurfaceFrame::Encode carries no slices of its own, which left 40-67 ms per
+  // Quran-page settle frame unattributable. DrawPath,
+  // RenderPass::EncodeCommands, the glyph atlas and tessellation were each
+  // measured and ruled out, and the residue does NOT scale with draw count (203
+  // draws cost 48 ms while 517 cost 44 ms) — so it is not the drawing at all.
+  // These three events partition the frame exhaustively: first pass,
+  // display-list replay, and FinishRecording, where render passes are built,
+  // targets allocated and commands encoded.
   FirstPassDispatcher collector(context, impeller::Matrix(), cull_rect);
-  display_list->Dispatch(collector, cull_rect);
+  {
+    TRACE_EVENT0("impeller", "DL::FirstPass");
+    display_list->Dispatch(collector, cull_rect);
+  }
 
   impeller::CanvasDlDispatcher impeller_dispatcher(
       context,                                   //
@@ -1333,8 +1345,14 @@ bool RenderToTarget(ContentContext& context,
     context.GetTextShadowCache().MarkFrameEnd();
   });
 
-  display_list->Dispatch(impeller_dispatcher, cull_rect);
-  impeller_dispatcher.FinishRecording();
+  {
+    TRACE_EVENT0("impeller", "DL::Replay");
+    display_list->Dispatch(impeller_dispatcher, cull_rect);
+  }
+  {
+    TRACE_EVENT0("impeller", "DL::FinishRecording");
+    impeller_dispatcher.FinishRecording();
+  }
   context.GetLazyGlyphAtlas()->ResetTextFrames();
 
   return true;
