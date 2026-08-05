@@ -415,6 +415,12 @@ void Canvas::RestoreToCount(size_t count) {
 }
 
 void Canvas::DrawPath(const flutter::DlPath& path, const Paint& paint) {
+  // Every filled path goes through here: one per line of Quran text (the mono
+  // vector branch below merges a whole line into one path) plus the surah-title
+  // and page-number painters. Traced to size the path-fill share of a settle
+  // frame — tessellation is already cached and cheap, so if the cost is here it
+  // is coverage/clip/vertex-upload per draw, not curve flattening.
+  TRACE_EVENT0("impeller", "Canvas::DrawPath");
   if (IsShadowBlurDrawOperation(paint)) {
     if (AttemptDrawBlurredPathSource(path, paint)) {
       return;
@@ -1919,6 +1925,94 @@ static constexpr Scalar kMaxTextScale = 250;
 void Canvas::DrawTextFrame(const std::shared_ptr<TextFrame>& text_frame,
                            Point position,
                            const Paint& paint) {
+  // Counts TEXT draws specifically, so they can be separated from the ornament
+  // painters (the surah-title painter alone issues 353 drawPath calls). One of
+  // these per style run: if a Quran line's word spans share one style the whole
+  // line is one draw, and if they do not it is one per word.
+  TRACE_EVENT0("impeller", "Canvas::DrawTextFrame");
+  // A paint-level color filter (or inversion) imposes the caller's own color on
+  // the text, so the font can contribute no color of its own: every glyph — and
+  // every COLR layer of it — resolves to the same fill. Draw the frame's
+  // outline once as a path: identical pixels, a fraction of the work, and
+  // vector-sharp at any scale, unlike the atlas (which rasterizes at a capped
+  // size).
+  //
+  // Deliberately NOT nested inside HasColor(). It used to be, which meant a run
+  // whose glyphs happen to carry no COLR record fell through to the bitmap
+  // glyph atlas even though the caller had asked for one flat color. In this
+  // app's fonts only ~1500 of ~4600 glyphs carry COLR, so that was not an edge
+  // case: measured on an S23 Ultra (2026-08-05), 932 of 2505 text draws — 37% —
+  // took the atlas branch. It cost the sharpness the vector path exists to
+  // protect, and it dominated the raster thread, because the atlas branch
+  // re-registers every glyph of every frame into the LazyGlyphAtlas on every
+  // frame (the atlas is reset per frame) and pays a CreateGlyphAtlas rebuild
+  // whenever it grows — 15.0 ms inside a single 16.5 ms text draw.
+  if (paint.color_filter || paint.invert_colors) {
+    fml::StatusOr<flutter::DlPath> mono_path = text_frame->GetPath();
+    if (mono_path.ok()) {
+      Save(1);
+      Concat(Matrix::MakeTranslation(position));
+      DrawPath(mono_path.value(), paint);
+      Restore();
+      return;
+    }
+    // No outline available (a bitmap-only color font, e.g. CBDT/sbix emoji):
+    // fall through so the glyph atlas handles it as before.
+  }
+  // Color (COLR) text with no imposed color: draw each glyph's color layers as
+  // vector paths so the palette shows through and stays crisp at any scale.
+  if (text_frame->HasColor()) {
+    // Cached on the frame — see TextFrame::GetColorPaths. Bound by reference so
+    // repainting does not copy the layer list every frame.
+    const std::vector<ColorGlyphLayer>& color_layers =
+        text_frame->GetColorPaths();
+    if (!color_layers.empty()) {
+      // A drawText op is budgeted exactly one depth slot by the DisplayList
+      // (AUTO_DEPTH_WATCHER(1u) in dl_dispatcher.cc), so all layers must share
+      // it: the first draw takes the slot and the rest stack on top of it via
+      // reuse_depth, composited in submission order — the same pattern
+      // BlurStyle::kSolid uses to draw the solid shape atop its blur.
+      Save(1);
+      Concat(Matrix::MakeTranslation(position));
+      // All layers share this op's single depth slot (the first draw takes
+      // it, the rest reuse it), and opaque same-depth draws resolve
+      // first-wins via the depth buffer. So paint front-to-back: topmost
+      // COLR layer first, base glyph last. Translucent palette colors would
+      // compose in the wrong order under this scheme, but COLRv0 tajweed
+      // palettes are opaque; a translucent layer just falls back to blending
+      // over whatever has already resolved.
+      // Hoisted out of the loop: the frame transform is fixed for all layers,
+      // and only `color` varies on the paint.
+      const Matrix frame_transform = GetCurrentTransform();
+      Paint layer_paint = paint;
+      layer_paint.style = Paint::Style::kFill;
+      layer_paint.color_source = nullptr;  // fill with the layer's own color
+      bool first_layer = true;
+      for (auto it = color_layers.rbegin(); it != color_layers.rend(); ++it) {
+        const ColorGlyphLayer& layer = *it;
+        layer_paint.color =
+            layer.use_foreground_color
+                ? paint.color
+                : layer.color.WithAlpha(layer.color.alpha * paint.color.alpha);
+        Entity entity;
+        // Glyph outlines are stored untranslated AND at one canonical size so
+        // the same extracted path is shared by every size and position it is
+        // drawn at; place and scale each one here instead. Scale is applied
+        // first (Impeller composes right-to-left).
+        entity.SetTransform(
+            frame_transform * Matrix::MakeTranslation(layer.offset) *
+            Matrix::MakeScale({layer.scale, layer.scale, 1.0f}));
+        entity.SetBlendMode(layer_paint.blend_mode);
+        FillPathGeometry geom(layer.path);
+        AddRenderEntityWithFiltersToCurrentPass(entity, &geom, layer_paint,
+                                                /*reuse_depth=*/!first_layer);
+        first_layer = false;
+      }
+      Restore();
+      return;
+    }
+  }
+
   Scalar max_scale = GetCurrentTransform().GetMaxBasisLengthXY();
   if (max_scale * text_frame->GetFont().GetMetrics().point_size >
       kMaxTextScale) {

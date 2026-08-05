@@ -115,6 +115,14 @@ double VsyncWaiterIOS::GetRefreshRate() const {
 
 - (void)onDisplayLink:(CADisplayLink*)link {
   CFTimeInterval delay = CACurrentMediaTime() - link.timestamp;
+  // On some iOS versions (observed on iOS 26) link.timestamp can be marginally
+  // ahead of CACurrentMediaTime(), yielding a negative delay. That would place
+  // frame_start_time in the future and trip FML_DCHECK(Now() >= frame_start_time)
+  // in VsyncWaiter::FireCallback. A negative "time since frame start" is
+  // nonsensical, so clamp it to zero.
+  if (delay < 0) {
+    delay = 0;
+  }
   fml::TimePoint frame_start_time = fml::TimePoint::Now() - fml::TimeDelta::FromSecondsF(delay);
 
   CFTimeInterval duration = link.targetTimestamp - link.timestamp;

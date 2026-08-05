@@ -16,11 +16,13 @@ TextFrame::TextFrame() = default;
 TextFrame::TextFrame(std::vector<TextRun>& runs,
                      Rect bounds,
                      bool has_color,
-                     const PathCreator& path_creator)
+                     const PathCreator& path_creator,
+                     const ColorPathCreator& color_path_creator)
     : runs_(std::move(runs)),
       bounds_(bounds),
       has_color_(has_color),
-      path_creator_(path_creator) {}
+      path_creator_(path_creator),
+      color_path_creator_(color_path_creator) {}
 
 TextFrame::~TextFrame() = default;
 
@@ -112,10 +114,26 @@ SubpixelPosition TextFrame::ComputeSubpixelPosition(
 }
 
 fml::StatusOr<flutter::DlPath> TextFrame::GetPath() const {
-  if (path_creator_) {
-    return path_creator_();
-  }
-  return fml::Status(fml::StatusCode::kCancelled, "no path creator specified.");
+  // Cached for the same reason as GetColorPaths: the caller is the rasterizer,
+  // which re-runs on every frame that repaints this text, while extraction
+  // walks the whole blob and copies every glyph outline.
+  std::call_once(path_once_, [this]() {
+    path_ =
+        path_creator_
+            ? path_creator_()
+            : fml::StatusOr<flutter::DlPath>(fml::Status(
+                  fml::StatusCode::kCancelled, "no path creator specified."));
+  });
+  return path_.value();
+}
+
+const std::vector<ColorGlyphLayer>& TextFrame::GetColorPaths() const {
+  std::call_once(color_paths_once_, [this]() {
+    if (color_path_creator_) {
+      color_paths_ = color_path_creator_();
+    }
+  });
+  return color_paths_;
 }
 
 const Font& TextFrame::GetFont() const {
