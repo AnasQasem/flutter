@@ -18,6 +18,7 @@
 #include "display_list/image/dl_image.h"
 #include "flutter/fml/logging.h"
 #include "flutter/fml/trace_event.h"
+#include "impeller/base/trace_draw.h"
 #include "impeller/base/validation.h"
 #include "impeller/core/formats.h"
 #include "impeller/display_list/color_filter.h"
@@ -420,7 +421,7 @@ void Canvas::DrawPath(const flutter::DlPath& path, const Paint& paint) {
   // and page-number painters. Traced to size the path-fill share of a settle
   // frame — tessellation is already cached and cheap, so if the cost is here it
   // is coverage/clip/vertex-upload per draw, not curve flattening.
-  TRACE_EVENT0("impeller", "Canvas::DrawPath");
+  IMPELLER_TRACE_DRAW("Canvas::DrawPath");
   if (IsShadowBlurDrawOperation(paint)) {
     if (AttemptDrawBlurredPathSource(path, paint)) {
       return;
@@ -1929,7 +1930,7 @@ void Canvas::DrawTextFrame(const std::shared_ptr<TextFrame>& text_frame,
   // painters (the surah-title painter alone issues 353 drawPath calls). One of
   // these per style run: if a Quran line's word spans share one style the whole
   // line is one draw, and if they do not it is one per word.
-  TRACE_EVENT0("impeller", "Canvas::DrawTextFrame");
+  IMPELLER_TRACE_DRAW("Canvas::DrawTextFrame");
   // A paint-level color filter (or inversion) imposes the caller's own color on
   // the text, so the font can contribute no color of its own: every glyph — and
   // every COLR layer of it — resolves to the same fill. Draw the frame's

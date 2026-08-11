@@ -175,4 +175,20 @@ void FontCollection::LoadFontFromList(Dart_Handle font_data_handle,
   tonic::DartInvoke(callback, {tonic::ToDart(0)});
 }
 
+void FontCollection::UnloadFont(const std::string& family_name) {
+  UIDartState::ThrowIfUIOperationsProhibited();
+  FontCollection& font_collection = UIDartState::Current()
+                                        ->platform_configuration()
+                                        ->client()
+                                        ->GetFontCollection();
+  if (!font_collection.dynamic_font_manager_->font_provider().UnregisterFamily(
+          family_name)) {
+    return;
+  }
+  // Same reason LoadFontFromList clears it: skparagraph memoizes family
+  // lookups, so a stale entry would keep handing out the typeface that was
+  // just dropped.
+  font_collection.collection_->ClearFontFamilyCache();
+}
+
 }  // namespace flutter

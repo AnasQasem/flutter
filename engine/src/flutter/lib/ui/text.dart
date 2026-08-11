@@ -3817,3 +3817,39 @@ FutureOr<void> _sendFontChangeMessage() async {
 
 @Native<Void Function(Handle, Handle, Handle)>(symbol: 'FontCollection::LoadFontFromList')
 external void _loadFontFromList(Uint8List list, _Callback<void> callback, String fontFamily);
+
+/// Releases a font family previously registered with [loadFontFromList],
+/// freeing the memory its bytes occupy.
+///
+/// [loadFontFromList] copies the font into engine memory and, until now, that
+/// copy lived for the rest of the process — an app that loads fonts as the user
+/// navigates could only accumulate them. This gives that memory back.
+///
+/// Text already laid out with `fontFamily` keeps rendering, because live
+/// paragraphs hold their own reference to the typeface. Anything laid out
+/// *after* this call falls back to another font, so only unload a family you
+/// are able to load again on demand.
+///
+/// Does nothing if `fontFamily` was never registered. It has no effect on fonts
+/// declared in `pubspec.yaml`, which are owned by the asset font manager.
+///
+/// Deliberately does NOT post a `fontsChange` the way [loadFontFromList] does,
+/// for two reasons:
+///
+///  * `fontsChange` relayouts *every* paragraph in the app. Unloading happens
+///    on a cache-eviction path, potentially while the user is scrolling, and a
+///    full relayout storm there is exactly the jank the eviction is meant to
+///    avoid paying for.
+///  * Not notifying is also the safer default. Text already on screen keeps its
+///    typeface alive by reference, so leaving it alone keeps rendering it
+///    correctly; forcing a relayout is what would make an evicted family fall
+///    back to tofu mid-frame.
+///
+/// Re-registering the family later through [loadFontFromList] does post
+/// `fontsChange`, so anything waiting on it still re-resolves.
+void unloadFont(String fontFamily) {
+  _unloadFont(fontFamily);
+}
+
+@Native<Void Function(Handle)>(symbol: 'FontCollection::UnloadFont')
+external void _unloadFont(String fontFamily);

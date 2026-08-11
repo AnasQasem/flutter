@@ -84,6 +84,7 @@ typedef CanvasPath Path;
   V(SemanticsUpdateBuilder::Create)                                \
   /* Other */                                                      \
   V(FontCollection::LoadFontFromList)                              \
+  V(FontCollection::UnloadFont)                                    \
   V(ImageDescriptor::initEncoded)                                  \
   V(Image::decodeImageFromPixelsSync)                              \
   V(ImageFilter::equals)                                           \
