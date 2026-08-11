@@ -9,6 +9,14 @@ declare_args() {
   impeller_debug =
       flutter_runtime_mode == "debug" || flutter_runtime_mode == "profile"
 
+  # Whether the PER-DRAW trace points (Canvas::DrawPath, Canvas::DrawTextFrame,
+  # RenderPass::EncodeCommands) are compiled in. They fire once per draw call —
+  # ~371 DrawPath per raster frame on a page of vector text — so they both cost
+  # raster-thread time and flood the timeline ring buffer. Default ON to keep
+  # existing attribution workflows working; set false for a measurement run
+  # that is free of the observer effect. See impeller/base/trace_draw.h.
+  impeller_trace_per_draw = true
+
   # Whether the Metal backend is enabled.
   impeller_enable_metal = (is_mac || is_ios) && target_os != "fuchsia"
 

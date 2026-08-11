@@ -51,6 +51,19 @@ class TypefaceFontAssetProvider : public FontAssetProvider {
   void RegisterTypeface(sk_sp<SkTypeface> typeface,
                         const std::string& family_name_alias);
 
+  /// Drops every typeface registered under `family_name`, releasing the font
+  /// data once nothing else references it. Returns true if a family was
+  /// removed.
+  ///
+  /// Registration has always been one-way, which makes dynamically loaded font
+  /// memory monotonic: an app that registers fonts as the user navigates can
+  /// only ever grow. Measured on a Quran reader that ships 36 merged Hafs
+  /// fonts, all 36 ended up resident as `SkMemoryStream` copies —
+  /// **62.6 MiB, 40 % of the process's native heap** — even though a reading
+  /// session touches two or three. Without this there is no way to give any of
+  /// it back.
+  bool UnregisterFamily(const std::string& family_name);
+
   // |FontAssetProvider|
   size_t GetFamilyCount() const override;
 

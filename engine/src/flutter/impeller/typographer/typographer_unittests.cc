@@ -137,6 +137,54 @@ TEST_P(TypographerTest, EqualBlobGeometrySharesOnePathIdentity) {
   EXPECT_NE(a.value().GetGeometryID(), big.value().GetGeometryID());
 }
 
+// The blob-path cache used to `clear()` wholesale on overflow, which threw away
+// the entries for the pages currently on screen along with everything else. In
+// this app that was reachable in ordinary use — 604 pages x ~15 lines against a
+// 256-entry cap, i.e. every ~17 pages of swiping — and it cascaded into the
+// tessellation cache, which keys on the generation id of exactly these paths.
+//
+// A blob that is still in use must survive an overflow.
+TEST_P(TypographerTest, BlobPathCacheKeepsHotEntryAcrossOverflow) {
+  SkFont font = flutter::testing::CreateTestFontOfSize(12);
+  auto path_id = [&font](const std::string& text) -> uint32_t {
+    auto blob = SkTextBlob::MakeFromString(text.c_str(), font);
+    EXPECT_TRUE(blob);
+    fml::StatusOr<flutter::DlPath> path =
+        MakeTextFrameFromTextBlobSkia(blob)->GetPath();
+    EXPECT_TRUE(path.ok());
+    return path.value().GetGeometryID();
+  };
+
+  // Letters only: the test font has no digit glyphs, and an all-notdef blob
+  // yields an empty outline that never reaches the cache.
+  auto filler = [](int i) {
+    std::string text = "fill";
+    for (int n = i; text.size() < 12u; n /= 26) {
+      text += static_cast<char>('a' + (n % 26));
+      if (n < 26) {
+        break;
+      }
+    }
+    return text;
+  };
+
+  const std::string hot = "the quick brown fox";
+  const uint32_t hot_id = path_id(hot);
+
+  // kMaxCachedBlobPaths is 256. Overflow it several times over, touching the
+  // hot entry often enough that it is never the least recently used.
+  for (int i = 0; i < 900; i++) {
+    path_id(filler(i));
+    if (i % 8 == 0) {
+      ASSERT_EQ(path_id(hot), hot_id) << "hot entry evicted at filler " << i;
+    }
+  }
+
+  // A clear-all would have rebuilt this with a fresh SkPath and a new
+  // generation id, silently invalidating the tessellation cache with it.
+  EXPECT_EQ(path_id(hot), hot_id);
+}
+
 // The rasterizer asks for these on every frame that repaints the text, and
 // extraction walks the COLR table plus every glyph outline. Recomputing it per
 // frame dominated the cost of scrolling color text, so the result is cached.

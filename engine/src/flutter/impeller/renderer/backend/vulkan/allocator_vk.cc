@@ -4,6 +4,7 @@
 
 #include "impeller/renderer/backend/vulkan/allocator_vk.h"
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -623,10 +624,28 @@ Bytes AllocatorVK::DebugGetHeapUsage() const {
 
 void AllocatorVK::DebugTraceMemoryStatistics() const {
 #ifdef IMPELLER_DEBUG
+  const double usage_mb = DebugGetHeapUsage().ConvertTo<MebiBytes>().GetSize();
   FML_TRACE_COUNTER("flutter", "AllocatorVK",
                     reinterpret_cast<int64_t>(this),  // Trace Counter ID
-                    "MemoryBudgetUsageMB",
-                    DebugGetHeapUsage().ConvertTo<MebiBytes>().GetSize());
+                    "MemoryBudgetUsageMB", usage_mb);
+
+  // The counter above is the only report of GPU-side memory Impeller produces,
+  // and in practice nobody ever sees it: DevTools' timeline export does not
+  // serialize counter tracks, so a 1.7 MB profile-mode export of this app
+  // contained no "AllocatorVK" or "MemoryBudgetUsageMB" record at all. That
+  // left the largest single component of native RSS unmeasurable from a trace.
+  //
+  // Log it periodically as well so it shows up in `flutter run` output, where
+  // it can actually be read and compared against `dumpsys meminfo`'s Graphics
+  // line. Every 300th present is ~2.5 s at 120 Hz — frequent enough to watch it
+  // grow while navigating, rare enough not to be spam. Debug/profile only.
+  static std::atomic<uint64_t> present_count{0};
+  constexpr uint64_t kLogEveryNPresents = 300;
+  if (present_count.fetch_add(1, std::memory_order_relaxed) %
+          kLogEveryNPresents ==
+      0) {
+    FML_LOG(INFO) << "[impeller] GPU heap in use: " << usage_mb << " MiB";
+  }
 #endif  // IMPELLER_DEBUG
 }
 

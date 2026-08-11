@@ -36,6 +36,21 @@ class FontCollection {
                                Dart_Handle callback,
                                const std::string& family_name);
 
+  /// Releases a family previously registered by [LoadFontFromList], freeing
+  /// the font bytes it copied.
+  ///
+  /// [LoadFontFromList] copies the whole font into an `SkMemoryStream`
+  /// (`copyData=true`) and the typeface owns that copy for the life of the
+  /// process, because until now nothing could take a dynamically loaded font
+  /// back out. For an app that registers fonts as the user navigates, resident
+  /// font memory could therefore only grow.
+  ///
+  /// Text already laid out with this family keeps rendering: the typeface is
+  /// refcounted, so live paragraphs hold it alive and only the provider's
+  /// reference is dropped. New layouts fall back until the family is loaded
+  /// again, so callers must be able to re-load it on demand.
+  static void UnloadFont(const std::string& family_name);
+
  private:
   std::shared_ptr<txt::FontCollection> collection_;
   sk_sp<txt::DynamicFontManager> dynamic_font_manager_;

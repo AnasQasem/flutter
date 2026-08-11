@@ -64,6 +64,32 @@ void TypefaceFontAssetProvider::RegisterTypeface(
   family_it->second->registerTypeface(std::move(typeface));
 }
 
+bool TypefaceFontAssetProvider::UnregisterFamily(
+    const std::string& family_name) {
+  if (family_name.empty()) {
+    return false;
+  }
+
+  const std::string canonical_name = CanonicalFamilyName(family_name);
+  auto family_it = registered_families_.find(canonical_name);
+  if (family_it == registered_families_.end()) {
+    return false;
+  }
+  registered_families_.erase(family_it);
+
+  // `family_names_` holds the ORIGINAL alias, not the canonical form, and
+  // GetFamilyName indexes straight into it — so the erase has to compare
+  // canonically but remove the original entry, or GetFamilyCount and
+  // GetFamilyName disagree.
+  for (auto it = family_names_.begin(); it != family_names_.end(); ++it) {
+    if (CanonicalFamilyName(*it) == canonical_name) {
+      family_names_.erase(it);
+      break;
+    }
+  }
+  return true;
+}
+
 TypefaceFontStyleSet::TypefaceFontStyleSet() = default;
 
 TypefaceFontStyleSet::~TypefaceFontStyleSet() = default;

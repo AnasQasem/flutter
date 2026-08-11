@@ -7,6 +7,7 @@
 #include <utility>
 #include "flutter/fml/trace_event.h"
 #include "fml/status.h"
+#include "impeller/base/trace_draw.h"
 #include "impeller/base/validation.h"
 #include "impeller/core/vertex_buffer.h"
 
@@ -81,7 +82,7 @@ bool RenderPass::EncodeCommands() const {
   // Quran page settle was unattributable. This splits it in two: time inside
   // here is translating entities into GPU commands, time outside is building
   // those entities (Canvas / geometry / tessellation).
-  TRACE_EVENT0("impeller", "RenderPass::EncodeCommands");
+  IMPELLER_TRACE_DRAW("RenderPass::EncodeCommands");
   return OnEncodeCommands(*context_);
 }
 

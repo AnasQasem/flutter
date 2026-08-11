@@ -4,6 +4,7 @@
 
 #include "impeller/typographer/backends/skia/text_frame_skia.h"
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -183,6 +184,88 @@ bool GetColrLayerRecord(const ColrV0& c,
   return true;
 }
 
+/// A cache of `V` keyed by a 64-bit identity, bounded by entry count, which
+/// drops the least recently used half when it overflows.
+///
+/// Both caches in this file used to `clear()` on overflow. That threw away the
+/// entries for the pages currently on SCREEN along with everything else, so the
+/// frame right after the cap was crossed had to re-extract every visible glyph
+/// and re-merge every visible line — a stall proportional to a whole page,
+/// recurring every time the working set crossed the bound. The blob-path cache
+/// made that reachable in ordinary use: the app has 604 pages x ~15 lines
+/// (~9060 distinct blobs) against a 256-entry cap, i.e. roughly every 17 pages
+/// of swiping.
+///
+/// It also cascaded. The merged paths rebuilt after a clear are fresh SkPaths,
+/// so their `getGenerationID()` values differ, which silently invalidates the
+/// tessellation cache for that content too (it keys on exactly that id).
+///
+/// Halving by age keeps the on-screen working set — 3 mounted pages is ~45
+/// blobs, far inside the cap — and amortizes each eviction over many inserts.
+/// Mirrors `ConvexTessellatorImpl::EvictLeastRecentlyUsed`, which is bounded by
+/// bytes rather than by count.
+///
+/// Not internally synchronized: callers hold their own mutex, as they did for
+/// the raw maps this replaces.
+template <typename V>
+class LruCache {
+ public:
+  explicit LruCache(size_t max_entries) : max_entries_(max_entries) {}
+
+  /// Returns a COPY, deliberately: the caller uses the value after dropping the
+  /// lock, and a later insert can evict and invalidate any reference into the
+  /// map. Both instantiations copy a refcount (`shared_ptr`, `DlPath`).
+  std::optional<V> Find(uint64_t key) {
+    auto it = entries_.find(key);
+    if (it == entries_.end()) {
+      return std::nullopt;
+    }
+    it->second.last_used = ++tick_;
+    return it->second.value;
+  }
+
+  V Insert(uint64_t key, V value) {
+    if (entries_.size() >= max_entries_) {
+      EvictOlderHalf(key);
+    }
+    Entry& entry = entries_[key];
+    entry.value = std::move(value);
+    entry.last_used = ++tick_;
+    return entry.value;
+  }
+
+ private:
+  struct Entry {
+    V value;
+    uint64_t last_used = 0u;
+  };
+
+  /// Drops the older half of the cache by last use, never `keep`.
+  void EvictOlderHalf(uint64_t keep) {
+    std::vector<uint64_t> by_age;
+    by_age.reserve(entries_.size());
+    for (const auto& [key, entry] : entries_) {
+      if (key != keep) {
+        by_age.push_back(key);
+      }
+    }
+    std::sort(by_age.begin(), by_age.end(), [&](uint64_t a, uint64_t b) {
+      return entries_.at(a).last_used < entries_.at(b).last_used;
+    });
+    const size_t target = max_entries_ / 2u;
+    for (uint64_t key : by_age) {
+      if (entries_.size() <= target) {
+        break;
+      }
+      entries_.erase(key);
+    }
+  }
+
+  std::unordered_map<uint64_t, Entry> entries_;
+  const size_t max_entries_;
+  uint64_t tick_ = 0u;
+};
+
 // One COLR layer of one glyph, in glyph-local space at kCanonicalGlyphSize.
 struct CachedLayer {
   flutter::DlPath path;
@@ -256,13 +339,13 @@ std::shared_ptr<const ColrTables> GetColrTables(SkTypeface* typeface) {
   // but bound it anyway — entries are cheap to rebuild.
   static constexpr size_t kMaxCachedTypefaces = 64;
   static std::mutex mutex;
-  static std::unordered_map<uint32_t, std::shared_ptr<const ColrTables>> cache;
+  static LruCache<std::shared_ptr<const ColrTables>> cache(kMaxCachedTypefaces);
 
   std::lock_guard<std::mutex> lock(mutex);
-  uint32_t key = typeface->uniqueID();
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second;
+  const uint64_t key = typeface->uniqueID();
+  if (std::optional<std::shared_ptr<const ColrTables>> hit = cache.Find(key);
+      hit.has_value()) {
+    return *hit;
   }
   auto tables = std::make_shared<ColrTables>();
   tables->colr_data =
@@ -270,10 +353,7 @@ std::shared_ptr<const ColrTables> GetColrTables(SkTypeface* typeface) {
   tables->colr = ParseColrV0(tables->colr_data);
   tables->palette = ParseCpalPalette0(
       typeface->copyTableData(SkSetFourByteTag('C', 'P', 'A', 'L')));
-  if (cache.size() >= kMaxCachedTypefaces) {
-    cache.clear();
-  }
-  return cache.emplace(key, std::move(tables)).first->second;
+  return cache.Insert(key, std::move(tables));
 }
 
 /// Walks `glyph_id`'s COLRv0 layer list and turns each layer into a colored
@@ -334,15 +414,15 @@ std::shared_ptr<const CachedGlyph> GetCachedGlyph(
   // because the app ships 36 Quran fonts with ~1500 color glyphs each.
   static constexpr size_t kMaxCachedGlyphs = 4096;
   static std::mutex mutex;
-  static std::unordered_map<uint64_t, std::shared_ptr<const CachedGlyph>> cache;
+  static LruCache<std::shared_ptr<const CachedGlyph>> cache(kMaxCachedGlyphs);
 
   const uint64_t key = (static_cast<uint64_t>(typeface->uniqueID()) << 16) |
                        static_cast<uint64_t>(glyph_id);
   {
     std::lock_guard<std::mutex> lock(mutex);
-    auto it = cache.find(key);
-    if (it != cache.end()) {
-      return it->second;
+    if (std::optional<std::shared_ptr<const CachedGlyph>> hit = cache.Find(key);
+        hit.has_value()) {
+      return *hit;
     }
   }
 
@@ -354,10 +434,7 @@ std::shared_ptr<const CachedGlyph> GetCachedGlyph(
       ExtractGlyph(typeface, glyph_id, colr, palette, canonical_paths);
 
   std::lock_guard<std::mutex> lock(mutex);
-  if (cache.size() >= kMaxCachedGlyphs) {
-    cache.clear();
-  }
-  return cache.insert_or_assign(key, std::move(glyph)).first->second;
+  return cache.Insert(key, std::move(glyph));
 }
 
 uint64_t MixKey(uint64_t hash, uint64_t value) {
@@ -427,14 +504,13 @@ std::optional<flutter::DlPath> GetSharedBlobPath(SkTextBlob* blob) {
   // pages of merged outlines. Bounded: text geometry is unbounded in general.
   static constexpr size_t kMaxCachedBlobPaths = 256;
   static std::mutex mutex;
-  static std::unordered_map<uint64_t, flutter::DlPath> cache;
+  static LruCache<flutter::DlPath> cache(kMaxCachedBlobPaths);
 
   const uint64_t key = BlobGeometryKey(blob);
   if (key != 0) {
     std::lock_guard<std::mutex> lock(mutex);
-    auto it = cache.find(key);
-    if (it != cache.end()) {
-      return it->second;
+    if (std::optional<flutter::DlPath> hit = cache.Find(key); hit.has_value()) {
+      return *hit;
     }
   }
   // Cache miss only. Traced because the cost that shows up as a cold page paint
@@ -452,10 +528,7 @@ std::optional<flutter::DlPath> GetSharedBlobPath(SkTextBlob* blob) {
     return result;
   }
   std::lock_guard<std::mutex> lock(mutex);
-  if (cache.size() >= kMaxCachedBlobPaths) {
-    cache.clear();
-  }
-  return cache.insert_or_assign(key, std::move(result)).first->second;
+  return cache.Insert(key, std::move(result));
 }
 
 }  // namespace
