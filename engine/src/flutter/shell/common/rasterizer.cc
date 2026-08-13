@@ -8,6 +8,19 @@
 #include <memory>
 #include <utility>
 
+// Must precede the FML_OS_ANDROID test below — the macro comes from here, and
+// this include sits above the fml headers that would otherwise define it.
+#include "flutter/fml/build_config.h"
+
+#if defined(FML_OS_ANDROID)
+#include <android/log.h>  // QURAN PATCH 006 instrumentation.
+#include <malloc.h>       // mallopt / M_PURGE_ALL — see PurgeNativeAllocator.
+#endif
+
+#if defined(FML_OS_IOS) || defined(FML_OS_MACOSX)
+#include <mach/mach.h>  // QURAN PATCH 006: phys_footprint via task_info.
+#endif
+
 #include "display_list/dl_builder.h"
 #include "flow/frame_timings.h"
 #include "flutter/common/constants.h"
@@ -23,6 +36,7 @@
 #include "impeller/renderer/context.h"
 #include "third_party/skia/include/core/SkColorSpace.h"
 #include "third_party/skia/include/core/SkData.h"
+#include "third_party/skia/include/core/SkGraphics.h"  // QURAN PATCH 005
 #include "third_party/skia/include/core/SkImage.h"
 #include "third_party/skia/include/core/SkImageInfo.h"
 #include "third_party/skia/include/core/SkMatrix.h"
@@ -39,9 +53,12 @@
 #include "third_party/skia/include/gpu/ganesh/SkSurfaceGanesh.h"
 
 #if IMPELLER_SUPPORTS_RENDERING
-#include "impeller/core/formats.h"                // nogncheck
-#include "impeller/display_list/aiks_context.h"   // nogncheck
-#include "impeller/display_list/dl_dispatcher.h"  // nogncheck
+#include "impeller/base/quran_mem_stats.h"             // nogncheck
+#include "impeller/core/formats.h"                     // nogncheck
+#include "impeller/display_list/aiks_context.h"        // nogncheck
+#include "impeller/display_list/dl_dispatcher.h"       // nogncheck
+#include "impeller/entity/contents/content_context.h"  // nogncheck QURAN PATCH 006
+#include "impeller/typographer/lazy_glyph_atlas.h"  // nogncheck QURAN PATCH 006
 #endif
 
 namespace flutter {
@@ -50,6 +67,94 @@ namespace flutter {
 // used within this interval.
 [[maybe_unused]] static constexpr std::chrono::milliseconds
     kSkiaCleanupExpiration(15000);
+
+namespace {
+
+/// QURAN PATCH 001: return decommitted pages to the operating system.
+///
+/// Freeing a block only hands it back to the allocator's arena. Scudo
+/// (Android's allocator since API 29) keeps that arena mapped, so a process
+/// that briefly peaks stays at the peak in RSS for the rest of its life.
+/// `mallopt(M_PURGE_ALL)` is the documented way to force the released pages
+/// back.
+///
+/// Cheap but not free — it walks the allocator's regions — so it belongs on a
+/// pressure signal, never on a frame path.
+void PurgeNativeAllocator() {
+#if defined(FML_OS_ANDROID)
+  // M_PURGE_ALL is API 31+ and is missing from older NDK headers (the sysroot
+  // this engine builds against defines M_PURGE but not M_PURGE_ALL), while the
+  // devices we target run API 35. Declare it rather than depend on the header,
+  // and fall back at RUNTIME: mallopt returns 0 for an option the platform does
+  // not know, so this costs one failed call on old devices and never
+  // misbehaves.
+  //
+  // The distinction matters here: M_PURGE only releases the calling thread's
+  // cache, and the memory we want back was freed on other threads (UI, IO,
+  // raster), so M_PURGE_ALL is the one that actually reclaims it.
+#ifndef M_PURGE_ALL
+#define M_PURGE_ALL (-104)
+#endif
+  // mallopt is __INTRODUCED_IN(26) and therefore a weak symbol; our minSdk is
+  // 29 so it is always bound, but check anyway — a null weak symbol would
+  // crash.
+  if (mallopt != nullptr && mallopt(M_PURGE_ALL, 0) == 0) {
+    mallopt(M_PURGE, 0);
+  }
+#endif  // FML_OS_ANDROID
+}
+
+/// QURAN PATCH 006 (instrumentation): live malloc bytes, so the teardown path
+/// can be attributed step by step.
+///
+/// Measured on an A146P: after a broad search plus scrolling every result,
+/// closing the search leaves ~372 MB of `HeapAlloc`, and the pressure path
+/// (Dart_NotifyLowMemory + the font-cache purge) frees none of it — but
+/// backgrounding drops it to ~97 MB and it STAYS there on resume. So ~270 MB is
+/// released by something on the teardown path only. Logging each stage names it
+/// instead of guessing; `dumpsys meminfo` cannot see inside a single call.
+size_t QuranLiveMallocKB() {
+#if defined(FML_OS_ANDROID)
+  // bionic's uordblks is size_t, so it does not overflow at these sizes the way
+  // glibc's int-based mallinfo would.
+  struct mallinfo info = mallinfo();
+  return static_cast<size_t>(info.uordblks) / 1024;
+#elif defined(FML_OS_IOS) || defined(FML_OS_MACOSX)
+  // phys_footprint, not resident_size: it is the figure iOS actually enforces
+  // its memory limit against, and the one Xcode's gauge shows.
+  task_vm_info_data_t info = {};
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO,
+                reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+    return 0;
+  }
+  return static_cast<size_t>(info.phys_footprint) / 1024;
+#else
+  return 0;
+#endif
+}
+
+void QuranLogMalloc(const char* where, size_t before) {
+  const size_t now = QuranLiveMallocKB();
+  const long long delta =
+      static_cast<long long>(now) - static_cast<long long>(before);
+#if defined(FML_OS_ANDROID)
+  __android_log_print(ANDROID_LOG_ERROR, "QURANMEM",
+                      "[%s] live_malloc %zuKB -> %zuKB (delta %lldKB)", where,
+                      before, now, delta);
+#elif defined(FML_OS_IOS) || defined(FML_OS_MACOSX)
+  // FML_LOG(ERROR) rather than __android_log_print, and ERROR rather than INFO
+  // so it survives to the device console / `flutter run` output.
+  FML_LOG(ERROR) << "QURANMEM [" << where << "] phys_footprint " << before
+                 << "KB -> " << now << "KB (delta " << delta << "KB)";
+#else
+  (void)where;
+  (void)before;
+  (void)delta;
+#endif
+}
+
+}  // namespace
 
 Rasterizer::Rasterizer(Delegate& delegate,
                        MakeGpuImageBehavior gpu_image_behavior)
@@ -118,21 +223,31 @@ void Rasterizer::TeardownExternalViewEmbedder() {
 }
 
 void Rasterizer::Teardown() {
+  // QURAN PATCH 006 (instrumentation): stage-by-stage, to find which of these
+  // releases the ~270 MB that the pressure path does not.
+  size_t quran_mark = QuranLiveMallocKB();
+  QuranLogMalloc("teardown:enter", quran_mark);
   is_torn_down_ = true;
   if (surface_) {
     auto context_switch = surface_->MakeRenderContextCurrent();
     if (context_switch->GetResult()) {
+      quran_mark = QuranLiveMallocKB();
       compositor_context_->OnGrContextDestroyed();
+      QuranLogMalloc("teardown:OnGrContextDestroyed", quran_mark);
 #if !SLIMPELLER
       if (auto* context = surface_->GetContext()) {
         context->purgeUnlockedResources(GrPurgeResourceOptions::kAllResources);
       }
 #endif  //  !SLIMPELLER
     }
+    quran_mark = QuranLiveMallocKB();
     surface_.reset();
+    QuranLogMalloc("teardown:surface_reset", quran_mark);
   }
 
+  quran_mark = QuranLiveMallocKB();
   view_records_.clear();
+  QuranLogMalloc("teardown:view_records_clear", quran_mark);
 
   if (raster_thread_merger_.get() != nullptr &&
       raster_thread_merger_.get()->IsMerged()) {
@@ -170,23 +285,96 @@ void Rasterizer::DisableThreadMergerIfNeeded() {
 
 void Rasterizer::NotifyLowMemoryWarning() const {
 #if !SLIMPELLER
-  if (!surface_) {
-    FML_DLOG(INFO)
-        << "Rasterizer::NotifyLowMemoryWarning called with no surface.";
-    return;
+  // Skia-only path. `Surface::GetContext()` returns a `GrDirectContext*`, and
+  // every Impeller surface returns nullptr from it ("Impeller != Skia",
+  // gpu_surface_vulkan_impeller.cc) — so on Impeller this whole block is a
+  // no-op and always has been. Upstream therefore does nothing at all for GPU
+  // memory when the platform reports pressure on an Impeller build.
+  if (surface_) {
+    if (auto context = surface_->GetContext()) {
+      auto context_switch = surface_->MakeRenderContextCurrent();
+      if (context_switch->GetResult()) {
+        context->performDeferredCleanup(std::chrono::milliseconds(0));
+      }
+    } else {
+      FML_DLOG(INFO) << "Rasterizer::NotifyLowMemoryWarning: no GrContext "
+                        "(expected on Impeller).";
+    }
   }
-  auto context = surface_->GetContext();
-  if (!context) {
-    FML_DLOG(INFO)
-        << "Rasterizer::NotifyLowMemoryWarning called with no GrContext.";
-    return;
-  }
-  auto context_switch = surface_->MakeRenderContextCurrent();
-  if (!context_switch->GetResult()) {
-    return;
-  }
-  context->performDeferredCleanup(std::chrono::milliseconds(0));
 #endif  //  !SLIMPELLER
+
+  // QURAN PATCH 001: hand freed pages back to the OS.
+  //
+  // Nothing in the engine has ever called into the allocator to release memory
+  // (`grep -rn "mallopt\|malloc_trim"` outside third_party finds nothing), so
+  // every free the engine performs — font unregistration, cache eviction, Dart
+  // GC, deferred GPU cleanup above — returns the block to Scudo's arena and
+  // leaves RSS at its high-water mark. Measured consequence: releasing ~14 MB
+  // of typefaces moved `Heap Alloc` down by 14 MB while `Native Heap` PSS did
+  // not move at all.
+  //
+  // This is the difference between "the engine freed it" and "the device got it
+  // back", so it gates the value of every other memory change.
+  //
+  // MEASURED 2026-08-12 (A146P): this does NOT recover the ~70 MB a broad
+  // search adds. `HeapAlloc` (live bytes) moved only 148 -> 139 MB across two
+  // purges and `HeapFree` never collapsed, so that memory is genuinely live in
+  // engine caches, not parked in the allocator. Kept because it is free and
+  // does return what IS free; it is simply not the lever it was hypothesised to
+  // be.
+#if IMPELLER_SUPPORTS_RENDERING
+  impeller::DumpQuranMemStats("before-purge");
+#endif
+
+  // QURAN PATCH 005: drop Skia's strike cache before handing pages back.
+  //
+  // A strike owns an SkScalerContext, which holds a strong ref to its typeface,
+  // so a font rasterised at any size outlives the family being unregistered.
+  // MEASURED (A146P): purging on unload cut peak RssAnon 505 -> 417 MB even
+  // though `GetFontCacheUsed()` reported under 2 MB of strike data — the bytes
+  // are not the strikes, they are the ~5 MB of font data per merged Hafs file
+  // (the SkMemoryStream copy plus FreeType's WOFF-decompressed sfnt) that the
+  // strikes were pinning.
+  //
+  // It belongs here too, and must run BEFORE PurgeNativeAllocator: freeing the
+  // typefaces only returns the blocks to Scudo's arena, and the mallopt below
+  // is what returns them to the OS. Without this the pressure path had nothing
+  // to purge, which is exactly why Patch 001 measured as a no-op.
+  // QURAN PATCH 006: release the accumulated glyph-atlas state.
+  //
+  // This is the memory the pressure path was missing. Attribution on an A146P
+  // after a broad search: `Rasterizer::Teardown` freed 272 MB, ALL of it inside
+  // `aiks_context_.reset()`, and inside that 262 MB was `lazy_glyph_atlas_`.
+  // Nothing else came close, and every other cache already has a counter.
+  //
+  // Before this, reclaiming it required destroying the surface — i.e. the user
+  // had to background the app. Closing a memory-heavy screen could not.
+  //
+  // Safe here: NotifyLowMemoryWarning is posted to the raster task runner, so
+  // it cannot land mid-frame, and the next frame repopulates what it needs.
+#if IMPELLER_SUPPORTS_RENDERING
+  if (surface_) {
+    if (std::shared_ptr<impeller::AiksContext> aiks =
+            surface_->GetAiksContext()) {
+      size_t atlas_mark = QuranLiveMallocKB();
+      aiks->GetContentContext().GetLazyGlyphAtlas()->ClearAtlasContexts();
+      QuranLogMalloc("pressure:ClearAtlasContexts", atlas_mark);
+    }
+  }
+#endif  // IMPELLER_SUPPORTS_RENDERING
+
+  // QURAN PATCH 006 (instrumentation): same units and tag as the teardown:*
+  // lines, so the two paths can be compared directly.
+  size_t quran_mark = QuranLiveMallocKB();
+  SkGraphics::PurgeFontCache();
+  QuranLogMalloc("pressure:PurgeFontCache", quran_mark);
+
+  quran_mark = QuranLiveMallocKB();
+  PurgeNativeAllocator();
+  QuranLogMalloc("pressure:PurgeNativeAllocator", quran_mark);
+#if IMPELLER_SUPPORTS_RENDERING
+  impeller::DumpQuranMemStats("after-purge");
+#endif
 }
 
 void Rasterizer::CollectView(int64_t view_id) {

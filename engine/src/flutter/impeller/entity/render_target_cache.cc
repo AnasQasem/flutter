@@ -3,15 +3,100 @@
 // found in the LICENSE file.
 
 #include "impeller/entity/render_target_cache.h"
+#include <algorithm>
+#include "impeller/base/quran_mem_stats.h"
 #include "impeller/core/formats.h"
+#include "impeller/core/texture.h"
+#include "impeller/core/texture_descriptor.h"
 #include "impeller/renderer/render_target.h"
 
 namespace impeller {
 
 RenderTargetCache::RenderTargetCache(std::shared_ptr<Allocator> allocator,
-                                     uint32_t keep_alive_frame_count)
+                                     uint32_t keep_alive_frame_count,
+                                     size_t max_cached_bytes)
     : RenderTargetAllocator(std::move(allocator)),
-      keep_alive_frame_count_(keep_alive_frame_count) {}
+      keep_alive_frame_count_(keep_alive_frame_count),
+      max_cached_bytes_(max_cached_bytes) {}
+
+size_t RenderTargetCache::RenderTargetBytes(const RenderTarget& render_target) {
+  size_t bytes = 0u;
+  render_target.IterateAllAttachments([&bytes](const Attachment& attachment) {
+    const Texture* textures[] = {attachment.texture.get(),
+                                 attachment.resolve_texture.get()};
+    for (const Texture* texture : textures) {
+      if (texture == nullptr) {
+        continue;
+      }
+      const TextureDescriptor& desc = texture->GetTextureDescriptor();
+      // Transient attachments are memoryless — they never receive device
+      // storage, so counting them would evict real textures to make room for
+      // bytes that do not exist. MSAA colour and depth/stencil both default to
+      // kDeviceTransient (`render_target.h`).
+      if (desc.storage_mode == StorageMode::kDeviceTransient) {
+        continue;
+      }
+      bytes += desc.GetByteSizeOfBaseMipLevel();
+    }
+    return true;
+  });
+  return bytes;
+}
+
+size_t RenderTargetCache::CachedTextureBytes() const {
+  size_t bytes = 0u;
+  for (const RenderTargetData& td : render_target_data_) {
+    bytes += RenderTargetBytes(td.render_target);
+  }
+  return bytes;
+}
+
+void RenderTargetCache::TrimToByteBudget() {
+  size_t total = CachedTextureBytes();
+  if (total <= max_cached_bytes_) {
+    return;
+  }
+
+  // Only targets that went unused in the frame just ended are candidates, and
+  // the ones nearest expiry go first — `keep_alive_frame_count` counts DOWN, so
+  // the smallest value is the entry that was about to be dropped anyway. This
+  // keeps the eviction order identical to the time-based policy and only makes
+  // it happen sooner.
+  std::vector<size_t> candidates;
+  candidates.reserve(render_target_data_.size());
+  for (size_t i = 0u; i < render_target_data_.size(); i++) {
+    if (!render_target_data_[i].used_this_frame) {
+      candidates.push_back(i);
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(), [this](size_t a, size_t b) {
+    return render_target_data_[a].keep_alive_frame_count <
+           render_target_data_[b].keep_alive_frame_count;
+  });
+
+  std::vector<bool> evict(render_target_data_.size(), false);
+  bool any = false;
+  for (size_t i : candidates) {
+    if (total <= max_cached_bytes_) {
+      break;
+    }
+    total -= RenderTargetBytes(render_target_data_[i].render_target);
+    evict[i] = true;
+    any = true;
+  }
+  if (!any) {
+    return;
+  }
+
+  std::vector<RenderTargetData> kept;
+  kept.reserve(render_target_data_.size());
+  for (size_t i = 0u; i < render_target_data_.size(); i++) {
+    if (!evict[i]) {
+      kept.push_back(std::move(render_target_data_[i]));
+    }
+  }
+  render_target_data_.swap(kept);
+}
 
 void RenderTargetCache::Start() {
   cache_disabled_count_ = 0;
@@ -33,6 +118,11 @@ void RenderTargetCache::End() {
     }
   }
   render_target_data_.swap(retain);
+  // QURAN PATCH 002: the time-based pass above has no idea how many bytes it
+  // just decided to keep. Enforce the ceiling as well.
+  TrimToByteBudget();
+  // QURAN PATCH 004: publish for the low-memory dump.
+  QuranRenderTargetBytes().store(static_cast<int64_t>(CachedTextureBytes()));
 }
 
 void RenderTargetCache::DisableCache() {

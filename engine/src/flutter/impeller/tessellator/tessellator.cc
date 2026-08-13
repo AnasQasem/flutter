@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "flutter/fml/trace_event.h"
+#include "flutter/impeller/base/quran_mem_stats.h"
 #include "flutter/impeller/core/device_buffer.h"
 #include "flutter/impeller/tessellator/path_tessellator.h"
 
@@ -403,11 +404,25 @@ class ConvexTessellatorImpl : public Tessellator::ConvexTessellator {
       entry.index_count = entry.indices.size();
     }
 
+    // QURAN PATCH 003: trim to the written prefix before accounting.
+    //
+    // `CountFillStorage` returns an UPPER BOUND on storage, and the writers
+    // routinely fill less than that, but `EntryBytes` measures `capacity()`.
+    // Without this the 24 MB budget is spent partly on capacity the entry never
+    // uses, so fewer real paths fit and the miss rate rises. Shrinking costs
+    // one memcpy per cache MISS (never per draw) and is safe because the read
+    // path indexes with `point_count`/`index_count` and never reads `size()`.
+    entry.points.resize(entry.point_count);
+    entry.indices.resize(entry.index_count);
+    entry.points.shrink_to_fit();
+    entry.indices.shrink_to_fit();
+
     cached_bytes_ += EntryBytes(entry);
     auto [it, inserted] = cache_.insert_or_assign(key, std::move(entry));
     if (cached_bytes_ > kMaxCachedBytes) {
       EvictLeastRecentlyUsed(key);
     }
+    QuranTessellationBytes().store(static_cast<int64_t>(cached_bytes_));
     return it;
   }
 

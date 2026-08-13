@@ -27,6 +27,30 @@ class LazyGlyphAtlas {
 
   void ResetTextFrames();
 
+  //----------------------------------------------------------------------------
+  /// @brief   QURAN PATCH 006: drop the accumulated atlas state entirely.
+  ///
+  ///          `ResetTextFrames` clears only the per-frame list and the current
+  ///          atlas handle — the `GlyphAtlasContext` survives, and with it the
+  ///          atlas's `ScaledFont` -> `FontGlyphAtlas` maps, the rect packer
+  ///          and the height adjustment. Those accumulate an entry per (font,
+  ///          glyph, scale) for the life of the surface and are never evicted.
+  ///
+  ///          MEASURED on an A146P: after a broad search plus scrolling every
+  ///          result, this held **262 MB** of live malloc — by far the largest
+  ///          single consumer, and more than every other instrumented cache
+  ///          combined (device buffers 4 MB, textures 26 MB, tessellation 6 MB,
+  ///          blob paths 5.6 MB, render targets 0.5 MB). It fits: this app
+  ///          ships 36 word-ligature Hafs fonts of ~4600 glyphs each, so a few
+  ///          scales apiece is on the order of a million map entries.
+  ///
+  ///          Destroying the surface is what used to reclaim it, which meant
+  ///          the app had to be backgrounded. This releases the same state in
+  ///          place. Call only between frames — the raster task runner already
+  ///          serialises `Rasterizer::NotifyLowMemoryWarning` against
+  ///          rasterization. The next frame rebuilds whatever it still needs.
+  void ClearAtlasContexts();
+
   const std::shared_ptr<GlyphAtlas>& CreateOrGetGlyphAtlas(
       Context& context,
       HostBuffer& host_buffer,

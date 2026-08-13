@@ -11,6 +11,7 @@
 #include "flutter/fml/memory/ref_ptr.h"
 #include "flutter/fml/trace_event.h"
 #include "impeller/base/allocation_size.h"
+#include "impeller/base/quran_mem_stats.h"  // QURAN PATCH 006
 #include "impeller/core/formats.h"
 #include "impeller/renderer/backend/vulkan/capabilities_vk.h"
 #include "impeller/renderer/backend/vulkan/device_buffer_vk.h"
@@ -413,9 +414,21 @@ class AllocatedTextureSourceVK final : public TextureSourceVK {
         std::move(rt_image_view), context.GetResourceAllocator(),
         context.GetDeviceHolder()));
     is_valid_ = true;
+    // QURAN PATCH 006 (instrumentation): device buffers accounted for only 4 MB
+    // of the 212 MB that `aiks_context_.reset()` frees, so count texture
+    // allocations too — on Mali these land in malloc, hence in `HeapAlloc`.
+    quran_accounted_bytes_ =
+        static_cast<int64_t>(desc.GetByteSizeOfBaseMipLevel());
+    QuranDeviceTextureBytes().fetch_add(quran_accounted_bytes_);
+    QuranDeviceTextureCount().fetch_add(1);
   }
 
-  ~AllocatedTextureSourceVK() = default;
+  ~AllocatedTextureSourceVK() {
+    if (quran_accounted_bytes_ != 0) {
+      QuranDeviceTextureBytes().fetch_sub(quran_accounted_bytes_);
+      QuranDeviceTextureCount().fetch_sub(1);
+    }
+  }
 
   bool IsValid() const { return is_valid_; }
 
@@ -461,6 +474,9 @@ class AllocatedTextureSourceVK final : public TextureSourceVK {
 
   UniqueResourceVKT<ImageResource> resource_;
   bool is_valid_ = false;
+  // QURAN PATCH 006 (instrumentation): remembered so the destructor subtracts
+  // exactly what the constructor added, even if the descriptor is unavailable.
+  int64_t quran_accounted_bytes_ = 0;
 
   AllocatedTextureSourceVK(const AllocatedTextureSourceVK&) = delete;
 

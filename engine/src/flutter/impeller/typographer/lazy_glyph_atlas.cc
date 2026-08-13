@@ -47,6 +47,20 @@ void LazyGlyphAtlas::ResetTextFrames() {
   color_data_.reset();
 }
 
+void LazyGlyphAtlas::ClearAtlasContexts() {
+  alpha_data_.reset();
+  color_data_.reset();
+  if (!typographer_context_) {
+    return;
+  }
+  // Replace rather than mutate: GlyphAtlasContext exposes no way to forget what
+  // it has packed, and a fresh one is exactly the state the constructor builds.
+  alpha_data_.context = typographer_context_->CreateGlyphAtlasContext(
+      GlyphAtlas::Type::kAlphaBitmap);
+  color_data_.context = typographer_context_->CreateGlyphAtlasContext(
+      GlyphAtlas::Type::kColorBitmap);
+}
+
 const std::shared_ptr<GlyphAtlas>& LazyGlyphAtlas::CreateOrGetGlyphAtlas(
     Context& context,
     HostBuffer& data_host_buffer,
