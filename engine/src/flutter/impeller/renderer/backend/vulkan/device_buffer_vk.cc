@@ -5,6 +5,7 @@
 #include "impeller/renderer/backend/vulkan/device_buffer_vk.h"
 
 #include "flutter/flutter_vma/flutter_vma.h"
+#include "impeller/base/quran_mem_stats.h"  // QURAN PATCH 006
 #include "impeller/renderer/backend/vulkan/context_vk.h"
 
 namespace impeller {
@@ -21,9 +22,18 @@ DeviceBufferVK::DeviceBufferVK(DeviceBufferDescriptor desc,
                     std::move(buffer),  //
                     info                //
                 }),
-      is_host_coherent_(is_host_coherent) {}
+      is_host_coherent_(is_host_coherent) {
+  // QURAN PATCH 006 (instrumentation): see QuranDeviceBufferBytes.
+  QuranDeviceBufferBytes().fetch_add(
+      static_cast<int64_t>(GetDeviceBufferDescriptor().size));
+  QuranDeviceBufferCount().fetch_add(1);
+}
 
-DeviceBufferVK::~DeviceBufferVK() = default;
+DeviceBufferVK::~DeviceBufferVK() {
+  QuranDeviceBufferBytes().fetch_sub(
+      static_cast<int64_t>(GetDeviceBufferDescriptor().size));
+  QuranDeviceBufferCount().fetch_sub(1);
+}
 
 uint8_t* DeviceBufferVK::OnGetContents() const {
   return static_cast<uint8_t*>(resource_->info.pMappedData);

@@ -6,6 +6,10 @@
 
 #include <mutex>
 
+#if defined(__ANDROID__)
+#include <android/log.h>  // QURAN PATCH 005
+#endif
+
 #include "flutter/lib/ui/text/asset_manager_font_provider.h"
 #include "flutter/lib/ui/ui_dart_state.h"
 #include "flutter/lib/ui/window/platform_configuration.h"
@@ -181,14 +185,64 @@ void FontCollection::UnloadFont(const std::string& family_name) {
                                         ->platform_configuration()
                                         ->client()
                                         ->GetFontCollection();
-  if (!font_collection.dynamic_font_manager_->font_provider().UnregisterFamily(
-          family_name)) {
+  txt::TypefaceFontAssetProvider& provider =
+      font_collection.dynamic_font_manager_->font_provider();
+
+  // QURAN PATCH 005: hold one ref across the drop so we can tell whether
+  // anything else still pins the typeface. This matters because the font's
+  // bytes hang off the typeface, not off the registration: a merged Hafs file
+  // costs ~1.96 MB for the `SkMemoryStream` copy `LoadFontFromList` makes plus
+  // ~3.09 MB for the sfnt FreeType rebuilds when it decompresses the WOFF.
+  // While a single ref survives, `unloadFont` frees nothing at all.
+  sk_sp<SkTypeface> typeface;
+  if (sk_sp<SkFontStyleSet> style_set = provider.MatchFamily(family_name)) {
+    if (style_set->count() > 0) {
+      typeface = style_set->createTypeface(0);
+    }
+  }
+
+  if (!provider.UnregisterFamily(family_name)) {
     return;
   }
   // Same reason LoadFontFromList clears it: skparagraph memoizes family
   // lookups, so a stale entry would keep handing out the typeface that was
   // just dropped.
   font_collection.collection_->ClearFontFamilyCache();
+
+  // `unique()` is the only ref-count query Skia exposes outside SK_DEBUG, and
+  // it is enough: we hold exactly one ref, so !unique() means something else
+  // still pins this typeface and its bytes cannot be returned.
+  const bool pinned_before_purge = typeface && !typeface->unique();
+
+  // QURAN PATCH 005: every SkStrike owns an SkScalerContext, which holds a
+  // strong ref to its typeface, and Skia's strike cache is process-global and
+  // keyed by size — so a font rasterised at any size outlives its family.
+  // Nothing else purges it: upstream only calls this from ~FontCollection.
+  //
+  // Cheap here because unloads are rare (eviction only) and this engine draws
+  // Quran text as tessellated vector paths whose results the blob-path cache
+  // memoises, so dropped strikes are not re-rasterised on the next frame.
+  const size_t strike_bytes_before = SkGraphics::GetFontCacheUsed();
+  SkGraphics::PurgeFontCache();
+
+#if defined(__ANDROID__)
+  // Same reasoning as impeller/base/quran_mem_stats.h: __android_log_print at
+  // ERROR priority, because an FML_LOG(INFO) here never reached logcat.
+  // pinned_after=0 means the strike cache was the only holder, so the font's
+  // bytes are actually returned here; pinned_after=1 means a live DisplayList,
+  // glyph atlas or Dart `ui.Paragraph` still holds it and eviction cannot win.
+  __android_log_print(
+      ANDROID_LOG_ERROR, "QURANMEM",
+      "[unload %s] pinned_before=%d pinned_after=%d "
+      "strike_cache=%lldKB->%lldKB",
+      family_name.c_str(), pinned_before_purge ? 1 : 0,
+      (typeface && !typeface->unique()) ? 1 : 0,
+      static_cast<long long>(strike_bytes_before / 1024),
+      static_cast<long long>(SkGraphics::GetFontCacheUsed() / 1024));
+#else
+  (void)pinned_before_purge;
+  (void)strike_bytes_before;
+#endif
 }
 
 }  // namespace flutter

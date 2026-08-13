@@ -6,6 +6,12 @@
 
 #include <memory>
 
+#include "flutter/fml/build_config.h"  // QURAN PATCH 006: FML_OS_ANDROID.
+#if defined(FML_OS_ANDROID)
+#include <android/log.h>
+#include <malloc.h>
+#endif
+
 #include "flow/surface_frame.h"
 #include "flutter/fml/make_copyable.h"
 #include "fml/trace_event.h"
@@ -73,6 +79,11 @@ GPUSurfaceVulkanImpeller::GPUSurfaceVulkanImpeller(
 }
 
 // |Surface|
+// QURAN PATCH 006 traced the 272 MB that `Rasterizer::Teardown` reclaims to
+// `aiks_context_` here (transients and impeller_context both freed 0), then to
+// `ContentContext::lazy_glyph_atlas_` inside it. The per-member instrumentation
+// is reverted now that `LazyGlyphAtlas::ClearAtlasContexts` releases that state
+// on the pressure path instead.
 GPUSurfaceVulkanImpeller::~GPUSurfaceVulkanImpeller() = default;
 
 // |Surface|

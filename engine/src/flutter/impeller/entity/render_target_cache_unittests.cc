@@ -50,6 +50,47 @@ class TestAllocator : public Allocator {
   bool should_fail = false;
 };
 
+// QURAN PATCH 002 — the cache is bounded by bytes as well as by frames.
+TEST_P(RenderTargetCacheTest,
+       ByteBudgetDropsUnusedTargetsBeforeKeepAliveExpires) {
+  // Budget of 1 byte: anything unused must go immediately, even though
+  // keep_alive_frame_count would hold it for four more frames.
+  auto cache = RenderTargetCache(GetContext()->GetResourceAllocator(),
+                                 /*keep_alive_frame_count=*/4,
+                                 /*max_cached_bytes=*/1u);
+
+  cache.Start();
+  cache.CreateOffscreen(*GetContext(), {100, 100}, 1);
+  cache.End();
+  // Used this frame, so it survives regardless of the budget — correct
+  // rendering outranks the ceiling.
+  EXPECT_EQ(cache.CachedTextureCount(), 1u);
+  EXPECT_GT(cache.CachedTextureBytes(), 0u);
+
+  // A frame that touches nothing. Time policy alone would still retain it.
+  cache.Start();
+  cache.End();
+  EXPECT_EQ(cache.CachedTextureCount(), 0u);
+  EXPECT_EQ(cache.CachedTextureBytes(), 0u);
+}
+
+TEST_P(RenderTargetCacheTest, DefaultByteBudgetLeavesNormalWorkingSetAlone) {
+  // The default ceiling must not change existing behaviour for a working set
+  // this small, or the patch would be trading raster time for nothing.
+  auto cache = RenderTargetCache(GetContext()->GetResourceAllocator(),
+                                 /*keep_alive_frame_count=*/4);
+
+  cache.Start();
+  cache.CreateOffscreen(*GetContext(), {100, 100}, 1);
+  cache.End();
+  cache.Start();
+  cache.End();
+
+  EXPECT_EQ(cache.CachedTextureCount(), 1u);
+  EXPECT_LE(cache.CachedTextureBytes(),
+            RenderTargetCache::kDefaultMaxCachedBytes);
+}
+
 TEST_P(RenderTargetCacheTest, CachesUsedTexturesAcrossFrames) {
   auto render_target_cache = RenderTargetCache(
       GetContext()->GetResourceAllocator(), /*keep_alive_frame_count=*/0);

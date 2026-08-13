@@ -9,6 +9,12 @@
 #include <utility>
 
 #include "flutter/display_list/image/dl_image.h"
+#include "flutter/fml/build_config.h"  // QURAN PATCH 006: FML_OS_ANDROID.
+#if defined(FML_OS_ANDROID)
+#include <android/log.h>
+#include <malloc.h>
+#endif
+
 #include "fml/trace_event.h"
 #include "impeller/base/validation.h"
 #include "impeller/core/formats.h"
@@ -879,6 +885,12 @@ ContentContext::ContentContext(
   InitializeCommonlyUsedShadersIfNeeded();
 }
 
+// QURAN PATCH 006 found the app's largest single memory consumer here by
+// releasing these members one at a time under `mallinfo`: `lazy_glyph_atlas_`
+// held 262 MB of the 272 MB that destroying the surface reclaimed. The bisect
+// itself is reverted — it changed member destruction order for no benefit once
+// the answer was known. `LazyGlyphAtlas::ClearAtlasContexts` is the fix, called
+// from `Rasterizer::NotifyLowMemoryWarning`.
 ContentContext::~ContentContext() = default;
 
 bool ContentContext::IsValid() const {

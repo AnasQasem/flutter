@@ -18,8 +18,23 @@ namespace impeller {
 ///        discarded.
 class RenderTargetCache : public RenderTargetAllocator {
  public:
+  /// QURAN PATCH 002: byte ceiling for the cache.
+  ///
+  /// Upstream bounds this cache by TIME ONLY (`keep_alive_frame_count`) and
+  /// keeps `render_target_data_` in an unbounded vector, so its size is
+  /// whatever the last few frames happened to allocate. That is fine for a UI
+  /// that draws a couple of offscreens; this app issues ~8 `saveLayer`s per
+  /// frame, and each one that misses the cache adds a full offscreen for at
+  /// least 4 frames.
+  ///
+  /// 32 MB is ~7 full-screen 1080x2408 RGBA targets — comfortably more than the
+  /// working set of one frame, so the steady state is unaffected and only a
+  /// pathological burst gets trimmed.
+  static constexpr size_t kDefaultMaxCachedBytes = 32u * 1024u * 1024u;
+
   explicit RenderTargetCache(std::shared_ptr<Allocator> allocator,
-                             uint32_t keep_alive_frame_count = 4);
+                             uint32_t keep_alive_frame_count = 4,
+                             size_t max_cached_bytes = kDefaultMaxCachedBytes);
 
   ~RenderTargetCache() = default;
 
@@ -65,6 +80,11 @@ class RenderTargetCache : public RenderTargetAllocator {
   // visible for testing.
   size_t CachedTextureCount() const;
 
+  /// Device-resident bytes currently held by the cache. Transient (memoryless)
+  /// attachments are excluded because they never get real storage.
+  /// Visible for testing.
+  size_t CachedTextureBytes() const;
+
  private:
   struct RenderTargetData {
     bool used_this_frame;
@@ -75,8 +95,16 @@ class RenderTargetCache : public RenderTargetAllocator {
 
   bool CacheEnabled() const;
 
+  /// Device-resident byte cost of one render target.
+  static size_t RenderTargetBytes(const RenderTarget& render_target);
+
+  /// Drop cached targets, nearest-to-expiry first, until the cache is inside
+  /// its byte budget. Never drops a target used in the frame just ended.
+  void TrimToByteBudget();
+
   std::vector<RenderTargetData> render_target_data_;
   uint32_t keep_alive_frame_count_;
+  size_t max_cached_bytes_;
   uint32_t cache_disabled_count_ = 0;
 
   RenderTargetCache(const RenderTargetCache&) = delete;

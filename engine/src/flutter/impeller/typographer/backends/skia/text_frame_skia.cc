@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "impeller/typographer/backends/skia/text_frame_skia.h"
+#include <atomic>
 
 #include <algorithm>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include "flutter/fml/logging.h"
 #include "flutter/fml/trace_event.h"
 #include "fml/status.h"
+#include "impeller/base/quran_mem_stats.h"
 #include "impeller/typographer/backends/skia/typeface_skia.h"
 #include "impeller/typographer/font.h"
 #include "impeller/typographer/glyph.h"
@@ -210,7 +212,12 @@ bool GetColrLayerRecord(const ColrV0& c,
 template <typename V>
 class LruCache {
  public:
-  explicit LruCache(size_t max_entries) : max_entries_(max_entries) {}
+  /// QURAN PATCH 004: `entry_counter`, when given, always holds the current
+  /// entry count so the low-memory dump can report how saturated each cache is
+  /// without needing access to these function-local statics.
+  explicit LruCache(size_t max_entries,
+                    std::atomic<int64_t>* entry_counter = nullptr)
+      : max_entries_(max_entries), entry_counter_(entry_counter) {}
 
   /// Returns a COPY, deliberately: the caller uses the value after dropping the
   /// lock, and a later insert can evict and invalidate any reference into the
@@ -231,6 +238,7 @@ class LruCache {
     Entry& entry = entries_[key];
     entry.value = std::move(value);
     entry.last_used = ++tick_;
+    ReportSize();
     return entry.value;
   }
 
@@ -239,6 +247,12 @@ class LruCache {
     V value;
     uint64_t last_used = 0u;
   };
+
+  void ReportSize() {
+    if (entry_counter_ != nullptr) {
+      entry_counter_->store(static_cast<int64_t>(entries_.size()));
+    }
+  }
 
   /// Drops the older half of the cache by last use, never `keep`.
   void EvictOlderHalf(uint64_t keep) {
@@ -259,10 +273,12 @@ class LruCache {
       }
       entries_.erase(key);
     }
+    ReportSize();
   }
 
   std::unordered_map<uint64_t, Entry> entries_;
   const size_t max_entries_;
+  std::atomic<int64_t>* entry_counter_ = nullptr;
   uint64_t tick_ = 0u;
 };
 
@@ -339,7 +355,8 @@ std::shared_ptr<const ColrTables> GetColrTables(SkTypeface* typeface) {
   // but bound it anyway — entries are cheap to rebuild.
   static constexpr size_t kMaxCachedTypefaces = 64;
   static std::mutex mutex;
-  static LruCache<std::shared_ptr<const ColrTables>> cache(kMaxCachedTypefaces);
+  static LruCache<std::shared_ptr<const ColrTables>> cache(
+      kMaxCachedTypefaces, &QuranColrTableEntries());
 
   std::lock_guard<std::mutex> lock(mutex);
   const uint64_t key = typeface->uniqueID();
@@ -353,6 +370,15 @@ std::shared_ptr<const ColrTables> GetColrTables(SkTypeface* typeface) {
   tables->colr = ParseColrV0(tables->colr_data);
   tables->palette = ParseCpalPalette0(
       typeface->copyTableData(SkSetFourByteTag('C', 'P', 'A', 'L')));
+  // QURAN PATCH 004: the COLR blob is an SkData copy per typeface, so its size
+  // is known exactly — unlike the path caches. 36 merged Quran fonts each
+  // carrying a COLR table makes this worth watching. Monotonic: an eviction is
+  // not subtracted, so read it as "bytes copied", an upper bound on what is
+  // resident.
+  if (tables->colr_data) {
+    QuranColrTableBytes().fetch_add(
+        static_cast<int64_t>(tables->colr_data->size()));
+  }
   return cache.Insert(key, std::move(tables));
 }
 
@@ -414,7 +440,8 @@ std::shared_ptr<const CachedGlyph> GetCachedGlyph(
   // because the app ships 36 Quran fonts with ~1500 color glyphs each.
   static constexpr size_t kMaxCachedGlyphs = 4096;
   static std::mutex mutex;
-  static LruCache<std::shared_ptr<const CachedGlyph>> cache(kMaxCachedGlyphs);
+  static LruCache<std::shared_ptr<const CachedGlyph>> cache(
+      kMaxCachedGlyphs, &QuranColrGlyphEntries());
 
   const uint64_t key = (static_cast<uint64_t>(typeface->uniqueID()) << 16) |
                        static_cast<uint64_t>(glyph_id);
@@ -504,7 +531,8 @@ std::optional<flutter::DlPath> GetSharedBlobPath(SkTextBlob* blob) {
   // pages of merged outlines. Bounded: text geometry is unbounded in general.
   static constexpr size_t kMaxCachedBlobPaths = 256;
   static std::mutex mutex;
-  static LruCache<flutter::DlPath> cache(kMaxCachedBlobPaths);
+  static LruCache<flutter::DlPath> cache(kMaxCachedBlobPaths,
+                                         &QuranBlobPathEntries());
 
   const uint64_t key = BlobGeometryKey(blob);
   if (key != 0) {
@@ -526,6 +554,18 @@ std::optional<flutter::DlPath> GetSharedBlobPath(SkTextBlob* blob) {
       SkMatrix::Translate(blob->bounds().left(), blob->bounds().top())));
   if (key == 0) {
     return result;
+  }
+  // QURAN PATCH 004: size the blob-path cache. Entry count alone was not enough
+  // — each entry is a merged path for a whole LINE of Quran text, so 149
+  // entries could plausibly be anywhere from 9 MB to 50 MB and that gap is
+  // exactly the unexplained part of the measured ~70 MB. SkPath storage is
+  // dominated by the point and verb arrays, so approximate it as
+  // points*sizeof(SkPoint) + verbs. Monotonic (evictions are not subtracted):
+  // read it as "bytes built", an upper bound on what the cache holds.
+  {
+    const SkPath& sk = result.GetSkPath();
+    QuranBlobPathBytes().fetch_add(static_cast<int64_t>(sk.countPoints()) * 8 +
+                                   sk.countVerbs());
   }
   std::lock_guard<std::mutex> lock(mutex);
   return cache.Insert(key, std::move(result));
